@@ -1,0 +1,432 @@
+---
+title: "IT Analytics Hackathon"
+author: "Alphonse Damas, Nina Pham, Chris Schaller"
+date: "10/16/2015"
+output: html_document
+---
+
+**This document will provide documentation and an understanding to the code we have written to determine early in a project's lifecycle, how many defects of which type will occur.**
+
+### Loading Libraries
+
+The code runs in R.  The following packages are required to run the code:
+
+```{r message=FALSE, results='hide'}
+# LOAD LIBRARIES ####
+library(magrittr)
+library(dplyr)
+library(lubridate)
+library(boot)
+library(ggplot2)
+library(reshape2)
+library(sampling)
+library(e1071)
+library(MASS)
+library(foreach)
+library(doMC)
+```
+
+### Loading Data
+
+Let's first load all of the data sets that were provided.
+
+```{r message=FALSE, results='hide'}
+# LOAD DATASETS ####
+app <- read.csv("/home/a630850/it_hackathon/Application.csv", stringsAsFactors=FALSE)
+project <- read.csv("/home/a630850/it_hackathon/Project.csv", stringsAsFactors=FALSE)
+pa <- read.csv("/home/a630850/it_hackathon/Project-Application.csv", stringsAsFactors=FALSE)
+as <- read.csv("/home/a630850/it_hackathon/Application Scan.csv", stringsAsFactors=FALSE)
+deploy <- read.csv("/home/a630850/it_hackathon/Deployment.csv", stringsAsFactors=FALSE)
+
+```
+
+### Cleaning Project Application Table
+
+From the Project Application table that was provided, extract out the ID variables and the dependent variables.  The dependent variables are all the variables that start with 'RCS'.
+
+```{r message=FALSE, results='hide'}
+# CLEAN PROJECT APPLICATION TABLE ####
+# extracted prID, apID and dependent variables
+pa1 <- pa %>% dplyr::select(prID, apID, starts_with('RCS'))
+```
+
+### Cleaning Project Table
+
+From the Project table, ID variables and variables that would be known only at the start of the project were extracted from the table. 
+
+```{r message=FALSE, results='hide'}
+# CLEAN PROJECT TABLE #### 
+# extracted only columns that we have at start of project
+project %<>%
+  dplyr::select(prID, StartDt, EndDt, PrimaryApp,  workingFcst, prDom,
+                prComp, invCateg, expTeam, expPM, expBA, expArch, expDev,
+                expQA,  expPS, prStartDayOfYear)
+```
+
+Now let's look at a summary of the project data.
+
+```{r}
+summary(project)
+```
+
+Looking at the summary of the project data, it is clear that we have some missing data.  In particular, we have data missing for the following variables:  expPM, expArch, expPS, prStartDayOfYear.  
+
+
+The prStartDayOfYear variable is derived based on what day of the year the project started on, its values range from 1 to 365.  So the NA value found within this field can be easily replaced with the correct value by doing some analysis.
+
+```{r}
+project$StartDt[is.na(project$prStartDayOfYear)]
+project$prStartDayOfYear[is.na(project$prStartDayOfYear)] <- 2
+```
+
+The variables with the prefix 'exp' denote the average number of hours a particular job function has had.  For an example, the variable expPM would mean the average number of hours of experience the project managers on the team have.  Therefore it is assumed that the data for these columns contain NAs because there were no members on the team with these job functions.  Hence, a value of 0 was replaced for all NAs values.
+
+```{r}
+project[is.na(project)] <- 0
+```
+
+Now let's look into the character variables to determine if there are any NAs.
+
+```{r}
+unique(project$prDom)
+unique(project$prComp)
+unique(project$invCateg)
+```
+
+There are NAs present in the prDom field so let's replace those with 'BLANK'
+
+```{r}
+project$prDom[project$prDom == '#N/A'] <- 'BLANK'
+```
+
+Also, let's now ensure that the dates are in date format.
+
+```{r}
+project %<>% mutate(StartDt = as.Date(StartDt, format = '%m/%d/%Y'),
+                    EndDt = as.Date(EndDt, format = '%m/%d/%Y'))
+```
+
+### Cleaning Applications Table
+
+One row had mostly empty data so row was removed.  In addition, all data was uppercased for consistency.
+
+```{r}
+app %<>%
+  filter(apID != 'A1525') %>%
+  mutate_each(funs(toupper))
+```
+
+Let's look at a summary of the applications data
+
+```{r}
+summary(app)
+```
+
+Looking at the summary of the project data, it is clear that we have some missing data.  In particular, we have data missing for the following variables:  apSLAC, apDRC.  Since there are so many NAs in both of these variables, let's create a new category named 'BLANK'.
+
+```{r}
+app$apSLAC[is.na(app$apSLAC)] <- 'BLANK'
+app$apDRC[is.na(app$apDRC)] <- 'BLANK'
+```
+
+Let's look to see if any of the character fields are empty.  If they are, let's create a new category named 'BLANK'.
+
+```{r}
+length(which(app$apDom == ''))
+length(which(app$apCritTr == ''))
+length(which(app$apWebCmp == ''))
+length(which(app$apMblCmp == ''))
+length(which(app$apMFCmp == ''))
+length(which(app$apPHI == ''))
+length(which(app$apPCI == ''))
+length(which(app$apPII == ''))
+length(which(app$apSecurRiskCls == ''))
+length(which(app$WebLyrs == ''))
+length(which(app$DynCodeScn == ''))
+
+app$apDom[app$apDom == ''] <- 'BLANK'
+app$apCritTr[app$apCritTr == ''] <- 'BLANK'
+app$apMblCmp[app$apMblCmp == ''] <- 'BLANK'
+```
+
+### Joining Data
+
+Join all three cleaned datasets together.
+
+```{r message=FALSE, results='hide', warning=FALSE}
+pa2 <- pa1 %>%
+  filter(prID != '#N/A') %>%
+  inner_join(., project, by = c('prID' = 'prID')) %>%
+  inner_join(., app)
+```
+
+### Feature Creation
+
+The following three variables were created:  
+1.  dayLen: The number of days a project took from start to estimated completion  
+2.  costPerDay: How much the project/application costs per day (working forcast divided by duration of project in days)  
+3.  startMonth: The month of the start date of the project  
+
+```{r}
+pa2 %<>% 
+  mutate(dayLen = EndDt - StartDt,
+         dayLen = as.numeric(dayLen),
+         costPerDay = workingFcst/dayLen,
+         startMonth = as.character(month(StartDt))) %>%
+  group_by(prID) %>%
+  mutate(numApps = n()) %>%
+  ungroup
+```
+
+### Viewing Distributions of Continuous Variables
+
+Boxplots and histograms were made to look at and understand distributions of continuous variables.  A log transformation was applied to variables that were not normally distributed.
+
+```{r message=FALSE, warning=FALSE}
+# PLOTS FOR CONTINUOUS VARS (on project level) ####
+bp <- pa2 %>%
+  dplyr::select(expPM, expBA, expArch, expDev, expQA, expPS, dayLen, costPerDay) %>%
+  unique %>%
+  melt
+
+ggplot(bp) +
+  geom_boxplot(aes(x=variable, y=value))
+
+qplot(value, data = bp, geom = "histogram", binwidth=120) +
+  facet_wrap(~ variable, scales = 'free')
+```
+
+### Transforming and Scaling Numerical Variables
+
+As seen in the plots, some of the variables are not normally distributed.  The skews of all the numeric variables are calculated.  For all numeric variables with skew >= 1.5, a log transformation was applied.  Afterwards, normalization was done to scale all variables.
+
+```{r}
+# VARIABLE TRANSFORMATIONS ####
+# find numeric cols
+num_cols <- which((sapply(pa2, is.numeric) |
+                     sapply(pa2, is.integer)) &
+                    !grepl('RCS', colnames(pa2)))
+# get skew for each
+skews <- apply(pa2[,num_cols], 2, skewness)
+
+# apply log tranformation to numerical variables with skew >= 1.5
+pos_log <- num_cols[which(skews >= 1.5)]
+neg_log <- num_cols[which(skews <= -1.5)]
+
+# replicate data, log necessary cols and normalize all numerics
+dta <- pa2
+dta[,pos_log] <- apply(dta[,pos_log], 2, function(x) log(x+1))
+dta[,neg_log] <- apply(dta[,neg_log], 2, function(x) log(max(x)-x+1))
+dta[,num_cols] <- apply(dta[,num_cols], 2, scale)
+```
+
+### Stratified Sampling of Train and Test Sets
+
+Stratified sampling was done to create the train and test data sets to ensure that both samples had an equal representation of data in the same start month and project domain.  Stratification was done based on start month because after data analysis, it was seen that a large proportation of projects were started in January.  Stratification was done based on project domain because it was suspected that  projects of the same domain should have similar types of defects.
+
+```{r}
+# CREATE STRATIFIED TRAIN AND TEST SAMPLES ####
+set.seed(1)
+train <- dta %>%
+  group_by(startMonth, prDom) %>%
+  sample_frac(0.7) %>%
+  ungroup
+test <- train %>% anti_join(dta, ., by = c('prID', 'apID'))
+```
+
+After the data sets were created, validation (in terms of looking at means and standard deviations of each variable) was done to ensure that the two samples were representative of the whole data sample.
+
+```{r}
+# table of means
+means <- rbind(apply(dta[,num_cols], 2, mean), 
+               apply(train[,num_cols], 2, mean), 
+               apply(test[,num_cols], 2, mean))
+rownames(means) <- c('full.means', 'train.means', 'test.means')
+colnames(means) <- colnames(dta[,num_cols])
+
+# table of sd
+stdev <- rbind(apply(dta[,num_cols], 2, sd), 
+               apply(train[,num_cols], 2, sd), 
+               apply(test[,num_cols], 2, sd))
+rownames(stdev) <- c('full.sd', 'train.sd', 'test.sd')
+colnames(stdev) <- colnames(dta[,num_cols])
+```
+```{r}
+# print means
+means
+```
+```{r}
+# print standard deviations
+stdev
+```
+
+### Resampling and Further Cleansing of Training Data
+
+Fifty subsamples of the training data was created to be used later for variable selection. In each of the fifty samples, it was then checked to see if any of the response variables were all zeros.  If a whole column of a particular response variable was zero then 5 randomly selected values of 0 within that column was replaced with a value of 1.  This was done so that the end prediction would not be 0.  This had to be done because after data analysis, the dependent variables are very heavily skewed towards 0.  Thus, this somewhat helps to relieve the bias towards zero.
+```{r}
+# RESAMPLING ####
+seeds <- sample(1000000, 50)
+resamp_dat <- NULL
+for (i in 1:50){
+  set.seed(seeds[i])
+  x <- train[sample(nrow(train), ceiling(nrow(train)*0.4)),]
+  x <- data.frame(seed = seeds[i], x)
+  resamp_dat <- rbind(resamp_dat, x)
+}
+
+# PUT IN ZEROS WHERE NEEDED ####
+# take sum of each response column for each resample
+z <- resamp_dat %>%
+  dplyr::select(seed, starts_with('RCS')) %>%
+  group_by(seed) %>%
+  summarise_each(funs(sum))
+
+# find columns with all zeros
+zz <- melt(z, id = 'seed') %>%
+  filter(value == 0) %>%
+  mutate(variable = as.character(variable))
+
+# replace N random records with 1 where necessary
+n_replace <- 5
+for (i in 1:nrow(zz)) {
+  r <- which(resamp_dat$seed == zz$seed[i])
+  r <- sample(r, n_replace)
+  resamp_dat[r, zz$variable[i]] <- 1
+}
+```
+
+### Capping Dependent Variables
+After examining the dependent variables, it was seen that there were sometimes a large number of defects that would occur.  Since this happens very infrequently (< 1% of the time), these large number of defects were capped at particular values that were found to be suitable after analysis.
+
+```{r message=FALSE, warning=FALSE}
+# ONE ROW PER PROJECT, APP, RESPONSE VARIABLE, CAPPING ####
+# function to transpose table
+# remove the total defects variable,
+# capping of variables
+transpose_cap = function(data) {
+  cols <- colnames(data)
+  data %<>%
+    melt(., id = cols[!grepl('RCS', cols)]) %>%
+    filter(variable != 'RCSDefTot') %>%
+    mutate(value_cap = value,
+           value_cap = ifelse(variable == 'RCS3Prty' & value > 3, 3, value_cap),
+           value_cap = ifelse(variable == 'RCSCodeMigr' & value > 4, 4, value_cap),
+           value_cap = ifelse(variable == 'RCSCode' & value > 18, 18, value_cap),
+           value_cap = ifelse(variable == 'RCSData' & value > 9, 9, value_cap),
+           value_cap = ifelse(variable == 'RCSDesign' & value > 8, 8, value_cap),
+           value_cap = ifelse(variable == 'RCSDup' & value > 1, 1, value_cap),
+           value_cap = ifelse(variable == 'RCSEnvir' & value > 6, 6, value_cap),
+           value_cap = ifelse(variable == 'RCSReqs' & value > 11, 11, value_cap),
+           value_cap = ifelse(variable == 'RCSTechSPc' & value > 4, 4, value_cap),
+           value_cap = ifelse(variable == 'RCSTesting' & value > 5, 5, value_cap),
+           value_cap = ifelse(variable == 'RCSBlank' & value > 4, 4, value_cap))
+  return(data)
+}
+
+# perform on resampling set, train and test
+resamp_dat <- transpose_cap(resamp_dat)
+train <- transpose_cap(train)
+test <- transpose_cap(test)
+```
+
+Because the dependent variable was found to be left skewed, the following models were tested for use:  
+1.  Poisson regression  
+2.  Zero inflated Poisson regression  
+3.  Negatibe binomial regression  
+4.  Zero inflated negative binomial regression  
+
+The Poisson regression on application level data yieled the best results.
+
+### Variable Selection
+
+Variable bootstrapping was performed on all 50 train resamples as a method of variable selection. This ensured that each variable chosen to be in the model is found to be significant in all subsamples of the data. Note that to quicken the speed of performing the model on each train subsample, the 'doMC' package was ultized to perform this on multi-cores since we are using RStudio on the edge node of a Hadoop cluster.
+
+
+```{r}
+# MODEL VARIABLE SELECTION ####
+# remove unnecessary columns
+dat <- resamp_dat[,-c(2:6)]
+
+# make all character columns factors
+char_cols <- which(sapply(dat, is.character))
+dat[,char_cols] <- lapply(dat[,char_cols], factor)
+
+# run model on subsets
+model_subset = function(form, s, mod, ...) {
+  d <- filter(dat, seed == s)
+  if (mod == 'nb')
+    m <- glm.nb(as.formula(form), d, ...)
+  if (mod == 'poisson')
+    m <- glm(as.formula(form), d, family = 'poisson', ...)
+  cs <- anova(m, test = 'Chisq')[,5]
+  return(c(s, cs[-1]))
+}
+
+# LEAVE invCateg, apMblCmp, apCritTr OUT if using negative binomial
+form <- 'value ~ variable + numApps + costPerDay + dayLen + prStartDayOfYear + expPS + expQA + expDev + expArch +
+expBA + expPM + expTeam + workingFcst + prComp + apDom + apSLAC + apDRC + apWebCmp + apMFCmp +
+apPHI + apPCI + apPII + apSecurRiskCls + WebLyrs + DynCodeScn + invCateg + apMblCmp + apCritTr'
+
+target <- strsplit(form, ' ~ ')[[1]][1]
+
+i <- 1
+new_form <- 'fake formula'
+model <- 'poisson'
+thresh <- 0.99
+
+while (form != new_form) {
+  if (i > 1) form <- new_form
+  registerDoMC(cores = 30)
+  s <- foreach(i = seeds, .combine = 'rbind') %dopar% model_subset(form, i, model)
+  rownames(s) <- 1:50
+  cn <- unlist(strsplit(form, '~'))[2]
+  cn <- unlist(strsplit(gsub('[[:space:]]+', '', cn), '\\+'))
+  colnames(s) <- c('seed', cn)
+  k <- names(which(colSums(s[,-1] < 0.05)/50 >= thresh))
+  new_form <- paste(target, paste(k, collapse = ' + '), sep = ' ~ ')
+  i <- i + 1
+}
+```
+
+After variable selection, it was determined that the formula used for the Poisson regression would be the following:
+```{r}
+new_form
+```
+
+### Modeling on Training Set
+
+The formula above is now used to create a model on the whole training set.
+
+```{r}
+# MODELING ON TRAINING SET ####
+new_form <- as.formula(new_form)
+nb1 <- glm.nb(new_form, train)
+pois1 <- glm(new_form, train, family = poisson())
+#zinb1 <- zeroinfl(new_form, data = train, dist = 'negbin', EM = TRUE)
+#zipois1 <- zeroinfl(new_form, data = train, dist = 'poisson', EM = TRUE)
+```
+
+### Predicting on the Test Set
+
+The above model created on the training data is now used to predict the test set data.
+
+```{r}
+results <- data.frame(actual = test$value,
+                      actual_cap = test$value_cap,
+                      variable = test$variable,
+                      nb_pred = predict(nb1, test, type = 'response'),
+                      pois_pred = predict(pois1, test, type = 'response'))
+```
+
+### Calculating results in terms of MSE and RMSE
+
+The MSE and RMSE is calculated for the model.
+
+```{r}
+results %>%
+  group_by(variable) %>%
+  summarise(pois_mse = mean((actual - pois_pred)^2),
+            pois_mse_cap = mean((actual_cap - pois_pred)^2),
+            nb_mse = mean((actual - nb_pred)^2),
+            nb_mse_cap = mean((actual_cap - nb_pred)^2))
+```
